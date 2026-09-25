@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -136,22 +137,56 @@ func TestProcessorRejectsMalformedPayloadWithoutRequeue(t *testing.T) {
 	}
 }
 
-func TestProcessorRejectsMessageFromAnotherApplicationRevision(t *testing.T) {
+func TestCandidateProcessesCrossRevisionRedeliveryWithStableIdentity(t *testing.T) {
 	dir := t.TempDir()
-	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
+	evidencePath := filepath.Join(dir, "evidence.jsonl")
+	recorder, _ := NewRecorder(evidencePath)
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
-	message, _ := example.NewMessage("application-revision-b", testTaskArtifact, "invocation-a", 1, example.BehaviorProcess)
+	candidateRevision := example.ApplicationRevision("application-revision-b")
+	candidateArtifact := example.ArtifactDigest("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, candidateRevision, candidateArtifact)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "handoff-invocation", 1, example.BehaviorProcess)
 
-	result := processor.Process(context.Background(), message)
-	if result.Err != nil || result.Disposition != Reject {
-		t.Fatalf("result = %#v; want recorded rejection", result)
+	first := processor.Process(context.Background(), message)
+	redelivery := processor.Process(context.Background(), message)
+	if first.Err != nil || first.Disposition != Acknowledge || first.MessageID != message.ID {
+		t.Fatalf("first candidate result = %#v; want acknowledgement for %s", first, message.ID)
+	}
+	if redelivery.Err != nil || redelivery.Disposition != Acknowledge || !redelivery.Duplicate || redelivery.MessageID != message.ID {
+		t.Fatalf("candidate redelivery result = %#v; want duplicate acknowledgement for %s", redelivery, message.ID)
 	}
 	entries, err := os.ReadDir(filepath.Join(dir, "ledger", "processed"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("mismatched application revision produced %d effects", len(entries))
+	if len(entries) != 1 {
+		t.Fatalf("cross-revision redelivery produced %d effects; want one", len(entries))
+	}
+
+	file, err := os.Open(evidencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	found := map[string]bool{}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var event Event
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Event != "processed" && event.Event != "duplicate_ignored" {
+			continue
+		}
+		if event.MessageID != message.ID || event.ProducerApplicationRevision != testApplicationRevision || event.TaskArtifactDigest != testTaskArtifact || event.WorkerApplicationRevision != candidateRevision || event.WorkerArtifactDigest != candidateArtifact {
+			t.Fatalf("cross-revision evidence = %#v", event)
+		}
+		found[event.Event] = true
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found["processed"] || !found["duplicate_ignored"] {
+		t.Fatalf("cross-revision evidence events = %#v", found)
 	}
 }

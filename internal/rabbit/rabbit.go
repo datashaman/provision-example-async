@@ -23,8 +23,7 @@ func OpenPublisher(urlFile string) (*Publisher, error) {
 		return nil, err
 	}
 	if err := channel.Confirm(false); err != nil {
-		channel.Close()
-		connection.Close()
+		_ = closeRabbitMQ(connection, channel)
 		return nil, fmt.Errorf("enable RabbitMQ publisher confirms: %w", err)
 	}
 	return &Publisher{connection: connection, channel: channel, returns: channel.NotifyReturn(make(chan amqp.Return, 1))}, nil
@@ -78,13 +77,11 @@ func OpenConsumer(urlFile, queue string) (*Consumer, error) {
 		return nil, err
 	}
 	if _, err := channel.QueueDeclarePassive(queue, true, false, false, false, nil); err != nil {
-		channel.Close()
-		connection.Close()
+		_ = closeRabbitMQ(connection, channel)
 		return nil, fmt.Errorf("verify queue %q: %w", queue, err)
 	}
 	if err := channel.Qos(1, 0, false); err != nil {
-		channel.Close()
-		connection.Close()
+		_ = closeRabbitMQ(connection, channel)
 		return nil, fmt.Errorf("set RabbitMQ prefetch: %w", err)
 	}
 	return &Consumer{connection: connection, channel: channel, queue: queue}, nil

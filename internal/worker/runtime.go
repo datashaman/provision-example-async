@@ -263,10 +263,10 @@ func settleWithoutProcessing(delivery Delivery, recorder EvidenceRecorder, confi
 
 func runtimeEvent(config RuntimeConfig, event string, messageID example.MessageID) Event {
 	return Event{
-		Event:                event,
-		MessageID:            messageID,
-		ApplicationRevision:  config.ApplicationRevision,
-		WorkerArtifactDigest: config.WorkerArtifactDigest,
+		Event:                     event,
+		MessageID:                 messageID,
+		WorkerApplicationRevision: config.ApplicationRevision,
+		WorkerArtifactDigest:      config.WorkerArtifactDigest,
 	}
 }
 

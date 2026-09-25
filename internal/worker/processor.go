@@ -34,15 +34,16 @@ type Result struct {
 }
 
 type Event struct {
-	SchemaVersion        string                      `json:"schemaVersion"`
-	Event                string                      `json:"event"`
-	MessageID            example.MessageID           `json:"messageId,omitempty"`
-	ApplicationRevision  example.ApplicationRevision `json:"applicationRevision"`
-	WorkerArtifactDigest example.ArtifactDigest      `json:"workerArtifactDigest"`
-	TaskArtifactDigest   example.ArtifactDigest      `json:"taskArtifactDigest,omitempty"`
-	InvocationID         example.InvocationID        `json:"invocationId,omitempty"`
-	Sequence             int                         `json:"sequence,omitempty"`
-	Attempt              int                         `json:"attempt,omitempty"`
+	SchemaVersion               string                      `json:"schemaVersion"`
+	Event                       string                      `json:"event"`
+	MessageID                   example.MessageID           `json:"messageId,omitempty"`
+	ProducerApplicationRevision example.ApplicationRevision `json:"producerApplicationRevision,omitempty"`
+	TaskArtifactDigest          example.ArtifactDigest      `json:"taskArtifactDigest,omitempty"`
+	WorkerApplicationRevision   example.ApplicationRevision `json:"workerApplicationRevision"`
+	WorkerArtifactDigest        example.ArtifactDigest      `json:"workerArtifactDigest"`
+	InvocationID                example.InvocationID        `json:"invocationId,omitempty"`
+	Sequence                    int                         `json:"sequence,omitempty"`
+	Attempt                     int                         `json:"attempt,omitempty"`
 }
 
 type EvidenceRecorder interface {
@@ -139,15 +140,6 @@ func (p *Processor) Process(ctx context.Context, message example.Message) Result
 		}
 		return result
 	}
-	if message.ApplicationRevision != p.applicationRevision {
-		result := Result{MessageID: message.ID, Disposition: Reject}
-		if err := p.recordMessage("application_revision_mismatch", message, 0); err != nil {
-			result.Disposition = 0
-			result.Err = err
-		}
-		return result
-	}
-
 	processedPath := filepath.Join(p.ledgerDir, "processed", fileKey(string(message.ID))+".json")
 	if _, err := os.Stat(processedPath); err == nil {
 		if err := p.recordMessage("duplicate_ignored", message, 0); err != nil {
@@ -246,17 +238,18 @@ func (p *Processor) recordedDisposition(message example.Message, event string, a
 
 func (p *Processor) recordMessage(name string, message example.Message, attempt int) error {
 	return p.record(Event{
-		Event:              name,
-		MessageID:          message.ID,
-		TaskArtifactDigest: message.TaskArtifactDigest,
-		InvocationID:       message.InvocationID,
-		Sequence:           message.Sequence,
-		Attempt:            attempt,
+		Event:                       name,
+		MessageID:                   message.ID,
+		ProducerApplicationRevision: message.ApplicationRevision,
+		TaskArtifactDigest:          message.TaskArtifactDigest,
+		InvocationID:                message.InvocationID,
+		Sequence:                    message.Sequence,
+		Attempt:                     attempt,
 	})
 }
 
 func (p *Processor) record(event Event) error {
-	event.ApplicationRevision = p.applicationRevision
+	event.WorkerApplicationRevision = p.applicationRevision
 	event.WorkerArtifactDigest = p.workerArtifactDigest
 	if err := p.recorder.Record(event); err != nil {
 		return fmt.Errorf("record %s evidence: %w", event.Event, err)
