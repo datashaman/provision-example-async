@@ -27,20 +27,26 @@ const (
 )
 
 type Result struct {
-	MessageID   string
+	MessageID   example.MessageID
 	Disposition Disposition
 	Duplicate   bool
+	Err         error
 }
 
 type Event struct {
-	SchemaVersion  string `json:"schemaVersion"`
-	Event          string `json:"event"`
-	MessageID      string `json:"messageId,omitempty"`
-	WorkerRevision string `json:"workerRevision"`
-	TaskRevision   string `json:"taskRevision,omitempty"`
-	InvocationID   string `json:"invocationId,omitempty"`
-	Sequence       int    `json:"sequence,omitempty"`
-	Attempt        int    `json:"attempt,omitempty"`
+	SchemaVersion        string                      `json:"schemaVersion"`
+	Event                string                      `json:"event"`
+	MessageID            example.MessageID           `json:"messageId,omitempty"`
+	ApplicationRevision  example.ApplicationRevision `json:"applicationRevision"`
+	WorkerArtifactDigest example.ArtifactDigest      `json:"workerArtifactDigest"`
+	TaskArtifactDigest   example.ArtifactDigest      `json:"taskArtifactDigest,omitempty"`
+	InvocationID         example.InvocationID        `json:"invocationId,omitempty"`
+	Sequence             int                         `json:"sequence,omitempty"`
+	Attempt              int                         `json:"attempt,omitempty"`
+}
+
+type EvidenceRecorder interface {
+	Record(Event) error
 }
 
 type Recorder struct {
@@ -79,104 +85,129 @@ func (r *Recorder) Close() error {
 }
 
 type Processor struct {
-	ledgerDir      string
-	holdDir        string
-	recorder       *Recorder
-	workerRevision string
+	ledgerDir            string
+	holdDir              string
+	recorder             EvidenceRecorder
+	applicationRevision  example.ApplicationRevision
+	workerArtifactDigest example.ArtifactDigest
 }
 
-func NewProcessor(ledgerDir, holdDir string, recorder *Recorder, workerRevision string) (*Processor, error) {
-	if ledgerDir == "" || holdDir == "" || recorder == nil || workerRevision == "" {
-		return nil, fmt.Errorf("ledger directory, hold directory, recorder, and worker revision are required")
+func NewProcessor(ledgerDir, holdDir string, recorder EvidenceRecorder, applicationRevision example.ApplicationRevision, workerArtifactDigest example.ArtifactDigest) (*Processor, error) {
+	if ledgerDir == "" || holdDir == "" || recorder == nil {
+		return nil, fmt.Errorf("ledger directory, hold directory, and recorder are required")
+	}
+	if err := applicationRevision.Validate(); err != nil {
+		return nil, err
+	}
+	if err := workerArtifactDigest.Validate("worker artifact"); err != nil {
+		return nil, err
 	}
 	for _, path := range []string{filepath.Join(ledgerDir, "processed"), filepath.Join(ledgerDir, "attempts"), holdDir} {
 		if err := os.MkdirAll(path, 0750); err != nil {
 			return nil, err
 		}
 	}
-	return &Processor{ledgerDir: ledgerDir, holdDir: holdDir, recorder: recorder, workerRevision: workerRevision}, nil
+	return &Processor{
+		ledgerDir:            ledgerDir,
+		holdDir:              holdDir,
+		recorder:             recorder,
+		applicationRevision:  applicationRevision,
+		workerArtifactDigest: workerArtifactDigest,
+	}, nil
 }
 
 func (p *Processor) ProcessPayload(ctx context.Context, payload []byte, brokerMessageID string) Result {
 	message, err := example.ParseMessage(payload)
-	if err != nil || (brokerMessageID != "" && brokerMessageID != message.ID) {
-		_ = p.recorder.Record(Event{Event: "invalid_message", MessageID: brokerMessageID, WorkerRevision: p.workerRevision})
-		return Result{MessageID: brokerMessageID, Disposition: Reject}
+	brokerID := example.MessageID(brokerMessageID)
+	if err != nil || (brokerMessageID != "" && brokerID != message.ID) {
+		result := Result{MessageID: brokerID, Disposition: Reject}
+		if recordErr := p.record(Event{Event: "invalid_message", MessageID: brokerID}); recordErr != nil {
+			result.Disposition = 0
+			result.Err = fmt.Errorf("record invalid message evidence: %w", recordErr)
+		}
+		return result
 	}
 	return p.Process(ctx, message)
 }
 
 func (p *Processor) Process(ctx context.Context, message example.Message) Result {
 	if err := message.Validate(); err != nil {
-		_ = p.recorder.Record(Event{Event: "invalid_message", MessageID: message.ID, WorkerRevision: p.workerRevision})
-		return Result{MessageID: message.ID, Disposition: Reject}
+		result := Result{MessageID: message.ID, Disposition: Reject}
+		if recordErr := p.record(Event{Event: "invalid_message", MessageID: message.ID}); recordErr != nil {
+			result.Disposition = 0
+			result.Err = fmt.Errorf("record invalid message evidence: %w", recordErr)
+		}
+		return result
 	}
-	event := func(name string, attempt int) {
-		_ = p.recorder.Record(Event{
-			Event:          name,
-			MessageID:      message.ID,
-			WorkerRevision: p.workerRevision,
-			TaskRevision:   message.Revision,
-			InvocationID:   message.InvocationID,
-			Sequence:       message.Sequence,
-			Attempt:        attempt,
-		})
+	if message.ApplicationRevision != p.applicationRevision {
+		result := Result{MessageID: message.ID, Disposition: Reject}
+		if err := p.recordMessage("application_revision_mismatch", message, 0); err != nil {
+			result.Disposition = 0
+			result.Err = err
+		}
+		return result
 	}
-	processedPath := filepath.Join(p.ledgerDir, "processed", fileKey(message.ID)+".json")
+
+	processedPath := filepath.Join(p.ledgerDir, "processed", fileKey(string(message.ID))+".json")
 	if _, err := os.Stat(processedPath); err == nil {
-		event("duplicate_ignored", 0)
+		if err := p.recordMessage("duplicate_ignored", message, 0); err != nil {
+			return Result{MessageID: message.ID, Err: err}
+		}
 		return Result{MessageID: message.ID, Disposition: Acknowledge, Duplicate: true}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		event("processing_failed", 0)
-		return Result{MessageID: message.ID, Disposition: Requeue}
+		return p.recordedDisposition(message, "processing_failed", 0, Requeue)
 	}
 
 	attempt, err := p.nextAttempt(message.ID)
 	if err != nil {
-		event("processing_failed", 0)
-		return Result{MessageID: message.ID, Disposition: Requeue}
+		return p.recordedDisposition(message, "processing_failed", 0, Requeue)
 	}
-	event("received", attempt)
-	switch message.Behavior {
-	case example.BehaviorHold:
-		event("held", attempt)
+	if err := p.recordMessage("received", message, attempt); err != nil {
+		return Result{MessageID: message.ID, Err: err}
+	}
+	semantics, err := message.Behavior.Semantics()
+	if err != nil {
+		return p.recordedDisposition(message, "invalid_message", attempt, Reject)
+	}
+	if semantics.Hold {
+		if err := p.recordMessage("held", message, attempt); err != nil {
+			return Result{MessageID: message.ID, Err: err}
+		}
 		if !p.waitForRelease(ctx, message.ID) {
-			event("released_for_redelivery", attempt)
-			return Result{MessageID: message.ID, Disposition: Requeue}
+			return p.recordedDisposition(message, "released_for_redelivery", attempt, Requeue)
 		}
-		event("hold_released", attempt)
-	case example.BehaviorFailOnce:
-		if attempt == 1 {
-			event("deliberate_failure", attempt)
-			return Result{MessageID: message.ID, Disposition: Requeue}
+		if err := p.recordMessage("hold_released", message, attempt); err != nil {
+			return Result{MessageID: message.ID, Err: err}
 		}
-	case example.BehaviorReject:
-		event("deliberate_rejection", attempt)
-		return Result{MessageID: message.ID, Disposition: Reject}
+	}
+	if attempt <= semantics.FailuresBeforeSuccess {
+		return p.recordedDisposition(message, "deliberate_failure", attempt, Requeue)
+	}
+	if semantics.Reject {
+		return p.recordedDisposition(message, "deliberate_rejection", attempt, Reject)
 	}
 	if err := writeExclusiveJSON(processedPath, message); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			event("duplicate_ignored", attempt)
-			return Result{MessageID: message.ID, Disposition: Acknowledge, Duplicate: true}
+			result := p.recordedDisposition(message, "duplicate_ignored", attempt, Acknowledge)
+			result.Duplicate = result.Err == nil
+			return result
 		}
-		event("processing_failed", attempt)
-		return Result{MessageID: message.ID, Disposition: Requeue}
+		return p.recordedDisposition(message, "processing_failed", attempt, Requeue)
 	}
-	event("processed", attempt)
-	return Result{MessageID: message.ID, Disposition: Acknowledge}
+	return p.recordedDisposition(message, "processed", attempt, Acknowledge)
 }
 
-func (p *Processor) Release(messageID string) error {
-	path := filepath.Join(p.holdDir, fileKey(messageID)+".release")
-	return os.WriteFile(path, []byte(messageID+"\n"), 0640)
+func (p *Processor) Release(messageID example.MessageID) error {
+	path := filepath.Join(p.holdDir, fileKey(string(messageID))+".release")
+	return os.WriteFile(path, []byte(string(messageID)+"\n"), 0640)
 }
 
-func (p *Processor) waitForRelease(ctx context.Context, messageID string) bool {
+func (p *Processor) waitForRelease(ctx context.Context, messageID example.MessageID) bool {
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
-	path := filepath.Join(p.holdDir, fileKey(messageID)+".release")
+	path := filepath.Join(p.holdDir, fileKey(string(messageID))+".release")
 	for {
-		if data, err := os.ReadFile(path); err == nil && string(data) == messageID+"\n" {
+		if data, err := os.ReadFile(path); err == nil && string(data) == string(messageID)+"\n" {
 			_ = os.Remove(path)
 			return true
 		}
@@ -188,8 +219,8 @@ func (p *Processor) waitForRelease(ctx context.Context, messageID string) bool {
 	}
 }
 
-func (p *Processor) nextAttempt(messageID string) (int, error) {
-	path := filepath.Join(p.ledgerDir, "attempts", fileKey(messageID)+".txt")
+func (p *Processor) nextAttempt(messageID example.MessageID) (int, error) {
+	path := filepath.Join(p.ledgerDir, "attempts", fileKey(string(messageID))+".txt")
 	attempt := 1
 	if data, err := os.ReadFile(path); err == nil {
 		previous, parseErr := strconv.Atoi(string(data))
@@ -204,6 +235,33 @@ func (p *Processor) nextAttempt(messageID string) (int, error) {
 		return 0, err
 	}
 	return attempt, nil
+}
+
+func (p *Processor) recordedDisposition(message example.Message, event string, attempt int, disposition Disposition) Result {
+	if err := p.recordMessage(event, message, attempt); err != nil {
+		return Result{MessageID: message.ID, Err: err}
+	}
+	return Result{MessageID: message.ID, Disposition: disposition}
+}
+
+func (p *Processor) recordMessage(name string, message example.Message, attempt int) error {
+	return p.record(Event{
+		Event:              name,
+		MessageID:          message.ID,
+		TaskArtifactDigest: message.TaskArtifactDigest,
+		InvocationID:       message.InvocationID,
+		Sequence:           message.Sequence,
+		Attempt:            attempt,
+	})
+}
+
+func (p *Processor) record(event Event) error {
+	event.ApplicationRevision = p.applicationRevision
+	event.WorkerArtifactDigest = p.workerArtifactDigest
+	if err := p.recorder.Record(event); err != nil {
+		return fmt.Errorf("record %s evidence: %w", event.Event, err)
+	}
+	return nil
 }
 
 func writeExclusiveJSON(path string, value any) error {

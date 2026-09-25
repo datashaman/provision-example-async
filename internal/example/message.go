@@ -5,11 +5,22 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 )
 
 const MessageSchemaVersion = "provision.dev/example-async-message/v1alpha1"
 
 type Behavior string
+
+type ApplicationRevision string
+
+type ArtifactDigest string
+
+type InvocationID string
+
+type MessageID string
+
+var sha256DigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 const (
 	BehaviorProcess  Behavior = "process"
@@ -19,50 +30,88 @@ const (
 )
 
 type Message struct {
-	SchemaVersion string   `json:"schemaVersion"`
-	ID            string   `json:"messageId"`
-	Revision      string   `json:"revision"`
-	InvocationID  string   `json:"invocationId"`
-	Sequence      int      `json:"sequence"`
-	Behavior      Behavior `json:"behavior"`
+	SchemaVersion       string              `json:"schemaVersion"`
+	ID                  MessageID           `json:"messageId"`
+	ApplicationRevision ApplicationRevision `json:"applicationRevision"`
+	TaskArtifactDigest  ArtifactDigest      `json:"taskArtifactDigest"`
+	InvocationID        InvocationID        `json:"invocationId"`
+	Sequence            int                 `json:"sequence"`
+	Behavior            Behavior            `json:"behavior"`
 }
 
-func NewMessage(revision, invocationID string, sequence int, behavior Behavior) (Message, error) {
+type BehaviorSemantics struct {
+	Hold                  bool
+	FailuresBeforeSuccess int
+	Reject                bool
+}
+
+func NewMessage(applicationRevision ApplicationRevision, taskArtifactDigest ArtifactDigest, invocationID InvocationID, sequence int, behavior Behavior) (Message, error) {
 	message := Message{
-		SchemaVersion: MessageSchemaVersion,
-		Revision:      revision,
-		InvocationID:  invocationID,
-		Sequence:      sequence,
-		Behavior:      behavior,
+		SchemaVersion:       MessageSchemaVersion,
+		ApplicationRevision: applicationRevision,
+		TaskArtifactDigest:  taskArtifactDigest,
+		InvocationID:        invocationID,
+		Sequence:            sequence,
+		Behavior:            behavior,
 	}
-	if revision == "" {
-		return Message{}, fmt.Errorf("revision is required")
+	if err := applicationRevision.Validate(); err != nil {
+		return Message{}, err
 	}
-	if invocationID == "" {
-		return Message{}, fmt.Errorf("invocation ID is required")
+	if err := taskArtifactDigest.Validate("task artifact"); err != nil {
+		return Message{}, err
+	}
+	if err := invocationID.Validate(); err != nil {
+		return Message{}, err
 	}
 	if sequence < 1 {
 		return Message{}, fmt.Errorf("sequence must be positive")
 	}
-	if !behavior.Valid() {
-		return Message{}, fmt.Errorf("unsupported behavior %q", behavior)
+	if _, err := behavior.Semantics(); err != nil {
+		return Message{}, err
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("provision-example-async\x00%s\x00%s\x00%d", revision, invocationID, sequence)))
-	message.ID = "msg-" + hex.EncodeToString(digest[:])
+	digest := sha256.Sum256([]byte(fmt.Sprintf("provision-example-async\x00%s\x00%s\x00%s\x00%d", applicationRevision, taskArtifactDigest, invocationID, sequence)))
+	message.ID = MessageID("msg-" + hex.EncodeToString(digest[:]))
 	return message, nil
 }
 
-func (b Behavior) Valid() bool {
+func (r ApplicationRevision) Validate() error {
+	if r == "" {
+		return fmt.Errorf("application revision is required")
+	}
+	return nil
+}
+
+func (d ArtifactDigest) Validate(label string) error {
+	if !sha256DigestPattern.MatchString(string(d)) {
+		return fmt.Errorf("%s digest must be a lowercase sha256 digest", label)
+	}
+	return nil
+}
+
+func (i InvocationID) Validate() error {
+	if i == "" {
+		return fmt.Errorf("invocation ID is required")
+	}
+	return nil
+}
+
+func (b Behavior) Semantics() (BehaviorSemantics, error) {
 	switch b {
-	case BehaviorProcess, BehaviorHold, BehaviorFailOnce, BehaviorReject:
-		return true
+	case BehaviorProcess:
+		return BehaviorSemantics{}, nil
+	case BehaviorHold:
+		return BehaviorSemantics{Hold: true}, nil
+	case BehaviorFailOnce:
+		return BehaviorSemantics{FailuresBeforeSuccess: 1}, nil
+	case BehaviorReject:
+		return BehaviorSemantics{Reject: true}, nil
 	default:
-		return false
+		return BehaviorSemantics{}, fmt.Errorf("unsupported behavior %q", b)
 	}
 }
 
 func (m Message) Validate() error {
-	want, err := NewMessage(m.Revision, m.InvocationID, m.Sequence, m.Behavior)
+	want, err := NewMessage(m.ApplicationRevision, m.TaskArtifactDigest, m.InvocationID, m.Sequence, m.Behavior)
 	if err != nil {
 		return err
 	}

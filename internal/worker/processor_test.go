@@ -11,6 +11,12 @@ import (
 	"github.com/datashaman/provision-example-async/internal/example"
 )
 
+const (
+	testApplicationRevision example.ApplicationRevision = "application-revision-a"
+	testTaskArtifact        example.ArtifactDigest      = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testWorkerArtifact      example.ArtifactDigest      = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
 func TestProcessorRecordsOneEffectForRepeatedDelivery(t *testing.T) {
 	dir := t.TempDir()
 	recorder, err := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
@@ -18,11 +24,11 @@ func TestProcessorRecordsOneEffectForRepeatedDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer recorder.Close()
-	processor, err := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-revision-a")
+	processor, err := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, _ := example.NewMessage("task-revision-a", "invocation-a", 1, example.BehaviorProcess)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorProcess)
 
 	first := processor.Process(context.Background(), message)
 	second := processor.Process(context.Background(), message)
@@ -45,8 +51,8 @@ func TestProcessorHoldCompletesAfterExplicitRelease(t *testing.T) {
 	dir := t.TempDir()
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-revision-a")
-	message, _ := example.NewMessage("task-revision-a", "invocation-a", 1, example.BehaviorHold)
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorHold)
 	result := make(chan Result, 1)
 	go func() { result <- processor.Process(context.Background(), message) }()
 
@@ -72,8 +78,8 @@ func TestProcessorHoldIsSafelyRequeuedOnCancellation(t *testing.T) {
 	dir := t.TempDir()
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-revision-a")
-	message, _ := example.NewMessage("task-revision-a", "invocation-a", 1, example.BehaviorHold)
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorHold)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan Result, 1)
 	go func() { result <- processor.Process(ctx, message) }()
@@ -94,8 +100,8 @@ func TestProcessorFailsOnceThenProcessesWithSameIdentity(t *testing.T) {
 	dir := t.TempDir()
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-revision-a")
-	message, _ := example.NewMessage("task-revision-a", "invocation-a", 1, example.BehaviorFailOnce)
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorFailOnce)
 
 	first := processor.Process(context.Background(), message)
 	second := processor.Process(context.Background(), message)
@@ -111,7 +117,7 @@ func TestProcessorRejectsMalformedPayloadWithoutRequeue(t *testing.T) {
 	dir := t.TempDir()
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-revision-a")
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
 	result := processor.ProcessPayload(context.Background(), []byte("not json"), "broker-id")
 	if result.Disposition != Reject {
 		t.Fatalf("result = %#v; want reject", result)
@@ -127,5 +133,25 @@ func TestProcessorRejectsMalformedPayloadWithoutRequeue(t *testing.T) {
 	}
 	if event.Event != "invalid_message" || event.MessageID != "broker-id" {
 		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestProcessorRejectsMessageFromAnotherApplicationRevision(t *testing.T) {
+	dir := t.TempDir()
+	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
+	defer recorder.Close()
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	message, _ := example.NewMessage("application-revision-b", testTaskArtifact, "invocation-a", 1, example.BehaviorProcess)
+
+	result := processor.Process(context.Background(), message)
+	if result.Err != nil || result.Disposition != Reject {
+		t.Fatalf("result = %#v; want recorded rejection", result)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "ledger", "processed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("mismatched application revision produced %d effects", len(entries))
 	}
 }

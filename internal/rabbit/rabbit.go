@@ -41,7 +41,7 @@ func (p *Publisher) Publish(ctx context.Context, queue string, message example.M
 	confirmation, err := p.channel.PublishWithDeferredConfirmWithContext(ctx, "", queue, true, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
-		MessageId:    message.ID,
+		MessageId:    string(message.ID),
 		Type:         example.MessageSchemaVersion,
 		Body:         payload,
 	})
@@ -54,7 +54,7 @@ func (p *Publisher) Publish(ctx context.Context, queue string, message example.M
 	}
 	select {
 	case returned := <-p.returns:
-		if returned.MessageId == message.ID {
+		if returned.MessageId == string(message.ID) {
 			return false, fmt.Errorf("broker returned message %s: %s", message.ID, returned.ReplyText)
 		}
 	default:
@@ -63,12 +63,7 @@ func (p *Publisher) Publish(ctx context.Context, queue string, message example.M
 }
 
 func (p *Publisher) Close() error {
-	channelErr := p.channel.Close()
-	connectionErr := p.connection.Close()
-	if channelErr != nil {
-		return channelErr
-	}
-	return connectionErr
+	return closeRabbitMQ(p.connection, p.channel)
 }
 
 type Consumer struct {
@@ -107,7 +102,7 @@ func (c *Consumer) Start(tag string) (<-chan worker.Delivery, error) {
 			raw := delivery
 			converted <- worker.Delivery{
 				Body:      raw.Body,
-				MessageID: raw.MessageId,
+				MessageID: example.MessageID(raw.MessageId),
 				Ack:       func() error { return raw.Ack(false) },
 				Nack:      func(requeue bool) error { return raw.Nack(false, requeue) },
 			}
@@ -121,8 +116,12 @@ func (c *Consumer) Cancel(tag string) error {
 }
 
 func (c *Consumer) Close() error {
-	channelErr := c.channel.Close()
-	connectionErr := c.connection.Close()
+	return closeRabbitMQ(c.connection, c.channel)
+}
+
+func closeRabbitMQ(connection *amqp.Connection, channel *amqp.Channel) error {
+	channelErr := channel.Close()
+	connectionErr := connection.Close()
 	if channelErr != nil {
 		return channelErr
 	}

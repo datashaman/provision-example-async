@@ -10,6 +10,11 @@ import (
 	"github.com/datashaman/provision-example-async/internal/example"
 )
 
+const (
+	testApplicationRevision example.ApplicationRevision = "application-revision-a"
+	testTaskArtifact        example.ArtifactDigest      = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+
 type recordingPublisher struct {
 	messages  []example.Message
 	confirmed []bool
@@ -34,7 +39,7 @@ func (p *recordingPublisher) Publish(_ context.Context, queue string, message ex
 func TestRunPublishesStableMessagesAndReportsConfirmations(t *testing.T) {
 	publisher := &recordingPublisher{}
 	var output bytes.Buffer
-	config := Config{Queue: "jobs", Revision: "revision-a", InvocationID: "invocation-a", Count: 2, Behavior: example.BehaviorProcess}
+	config := Config{Queue: "jobs", ApplicationRevision: testApplicationRevision, TaskArtifactDigest: testTaskArtifact, InvocationID: "invocation-a", Count: 2, Behavior: example.BehaviorProcess}
 
 	if err := Run(context.Background(), config, publisher, &output); err != nil {
 		t.Fatal(err)
@@ -42,19 +47,19 @@ func TestRunPublishesStableMessagesAndReportsConfirmations(t *testing.T) {
 	if len(publisher.messages) != 2 {
 		t.Fatalf("published %d messages; want 2", len(publisher.messages))
 	}
-	first, _ := example.NewMessage("revision-a", "invocation-a", 1, example.BehaviorProcess)
-	second, _ := example.NewMessage("revision-a", "invocation-a", 2, example.BehaviorProcess)
+	first, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorProcess)
+	second, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 2, example.BehaviorProcess)
 	if publisher.messages[0].ID != first.ID || publisher.messages[1].ID != second.ID {
 		t.Fatalf("unexpected stable IDs: %#v", publisher.messages)
 	}
 
 	decoder := json.NewDecoder(&output)
-	for sequence, wantID := range []string{first.ID, second.ID} {
+	for sequence, wantID := range []example.MessageID{first.ID, second.ID} {
 		var event Confirmation
 		if err := decoder.Decode(&event); err != nil {
 			t.Fatal(err)
 		}
-		if event.Event != "message_confirmed" || event.MessageID != wantID || event.Sequence != sequence+1 {
+		if event.Event != "message_confirmed" || event.MessageID != wantID || event.ApplicationRevision != testApplicationRevision || event.TaskArtifactDigest != testTaskArtifact || event.Sequence != sequence+1 {
 			t.Fatalf("unexpected confirmation: %#v", event)
 		}
 	}
@@ -70,7 +75,7 @@ func TestRunPublishesStableMessagesAndReportsConfirmations(t *testing.T) {
 func TestRunDoesNotClaimAnUnconfirmedMessage(t *testing.T) {
 	publisher := &recordingPublisher{confirmed: []bool{false}}
 	var output bytes.Buffer
-	err := Run(context.Background(), Config{Queue: "jobs", Revision: "revision-a", InvocationID: "invocation-a", Count: 1, Behavior: example.BehaviorProcess}, publisher, &output)
+	err := Run(context.Background(), Config{Queue: "jobs", ApplicationRevision: testApplicationRevision, TaskArtifactDigest: testTaskArtifact, InvocationID: "invocation-a", Count: 1, Behavior: example.BehaviorProcess}, publisher, &output)
 	if err == nil {
 		t.Fatal("expected unconfirmed publish to fail")
 	}
@@ -82,7 +87,7 @@ func TestRunDoesNotClaimAnUnconfirmedMessage(t *testing.T) {
 func TestRunStopsAtFirstPublishFailure(t *testing.T) {
 	publisher := &recordingPublisher{errAt: 2}
 	var output bytes.Buffer
-	err := Run(context.Background(), Config{Queue: "jobs", Revision: "revision-a", InvocationID: "invocation-a", Count: 3, Behavior: example.BehaviorProcess}, publisher, &output)
+	err := Run(context.Background(), Config{Queue: "jobs", ApplicationRevision: testApplicationRevision, TaskArtifactDigest: testTaskArtifact, InvocationID: "invocation-a", Count: 3, Behavior: example.BehaviorProcess}, publisher, &output)
 	if err == nil {
 		t.Fatal("expected publish failure")
 	}

@@ -9,21 +9,24 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/datashaman/provision-example-async/internal/example"
 )
 
 const StateSchemaVersion = "provision.dev/example-async-worker-state/v1alpha1"
 
 type RuntimeConfig struct {
-	Revision     string
-	Queue        string
-	GateFile     string
-	StateFile    string
-	PollInterval time.Duration
+	ApplicationRevision  example.ApplicationRevision
+	WorkerArtifactDigest example.ArtifactDigest
+	Queue                string
+	GateFile             string
+	StateFile            string
+	PollInterval         time.Duration
 }
 
 type Delivery struct {
 	Body      []byte
-	MessageID string
+	MessageID example.MessageID
 	Ack       func() error
 	Nack      func(requeue bool) error
 }
@@ -34,13 +37,14 @@ type Consumer interface {
 }
 
 type State struct {
-	SchemaVersion     string `json:"schemaVersion"`
-	Revision          string `json:"revision"`
-	Queue             string `json:"queue"`
-	Connected         bool   `json:"connected"`
-	Gated             bool   `json:"gated"`
-	Consuming         bool   `json:"consuming"`
-	InFlightMessageID string `json:"inFlightMessageId,omitempty"`
+	SchemaVersion        string                      `json:"schemaVersion"`
+	ApplicationRevision  example.ApplicationRevision `json:"applicationRevision"`
+	WorkerArtifactDigest example.ArtifactDigest      `json:"workerArtifactDigest"`
+	Queue                string                      `json:"queue"`
+	Connected            bool                        `json:"connected"`
+	Gated                bool                        `json:"gated"`
+	Consuming            bool                        `json:"consuming"`
+	InFlightMessageID    example.MessageID           `json:"inFlightMessageId,omitempty"`
 }
 
 type completedDelivery struct {
@@ -49,8 +53,14 @@ type completedDelivery struct {
 }
 
 func (c RuntimeConfig) Validate() error {
-	if c.Revision == "" || c.Queue == "" || c.GateFile == "" || c.StateFile == "" {
-		return fmt.Errorf("revision, queue, gate file, and state file are required")
+	if err := c.ApplicationRevision.Validate(); err != nil {
+		return err
+	}
+	if err := c.WorkerArtifactDigest.Validate("worker artifact"); err != nil {
+		return err
+	}
+	if c.Queue == "" || c.GateFile == "" || c.StateFile == "" {
+		return fmt.Errorf("queue, gate file, and state file are required")
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("poll interval must be positive")
@@ -58,14 +68,21 @@ func (c RuntimeConfig) Validate() error {
 	return nil
 }
 
-func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor *Processor, recorder *Recorder) error {
+func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor *Processor, recorder EvidenceRecorder) error {
 	if err := config.Validate(); err != nil {
 		return err
 	}
 	if consumer == nil || processor == nil || recorder == nil {
 		return fmt.Errorf("consumer, processor, and recorder are required")
 	}
-	state := State{SchemaVersion: StateSchemaVersion, Revision: config.Revision, Queue: config.Queue, Connected: true, Gated: true}
+	state := State{
+		SchemaVersion:        StateSchemaVersion,
+		ApplicationRevision:  config.ApplicationRevision,
+		WorkerArtifactDigest: config.WorkerArtifactDigest,
+		Queue:                config.Queue,
+		Connected:            true,
+		Gated:                true,
+	}
 	writeState := func() error { return writeStateFile(config.StateFile, state) }
 	if err := writeState(); err != nil {
 		return err
@@ -76,9 +93,11 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 		state.Gated = true
 		_ = writeState()
 	}()
-	_ = recorder.Record(Event{Event: "connected_gated", WorkerRevision: config.Revision})
+	if err := recorder.Record(runtimeEvent(config, "connected_gated", "")); err != nil {
+		return fmt.Errorf("record connected gated evidence: %w", err)
+	}
 
-	tag := "provision-example-async-" + consumerTag(config.Revision)
+	tag := "provision-example-async-" + consumerTag(string(config.WorkerArtifactDigest))
 	ticker := time.NewTicker(config.PollInterval)
 	defer ticker.Stop()
 	processCtx, cancelProcessing := context.WithCancel(ctx)
@@ -98,7 +117,9 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 				return fmt.Errorf("fence consumer intake: %w", err)
 			}
 			state.Consuming = false
-			_ = recorder.Record(Event{Event: "intake_gated", WorkerRevision: config.Revision})
+			if err := recorder.Record(runtimeEvent(config, "intake_gated", "")); err != nil {
+				return fmt.Errorf("record intake gated evidence: %w", err)
+			}
 		}
 		if open && !state.Consuming && current == nil && deliveries == nil {
 			started, err := consumer.Start(tag)
@@ -107,7 +128,9 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 			}
 			deliveries = started
 			state.Consuming = true
-			_ = recorder.Record(Event{Event: "intake_opened", WorkerRevision: config.Revision})
+			if err := recorder.Record(runtimeEvent(config, "intake_opened", "")); err != nil {
+				return fmt.Errorf("record intake opened evidence: %w", err)
+			}
 		}
 		return writeState()
 	}
@@ -128,7 +151,7 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 			cancelProcessing()
 			if current != nil {
 				finished := <-completed
-				if err := finishDelivery(finished, recorder, config.Revision); err != nil {
+				if err := finishDelivery(finished, recorder, config); err != nil {
 					return err
 				}
 				current = nil
@@ -148,24 +171,40 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 				}
 				continue
 			}
+			if err := reconcileGate(); err != nil {
+				return err
+			}
+			if state.Gated {
+				if err := settleWithoutProcessing(delivery, recorder, config, "post_gate_delivery_requeue_decided"); err != nil {
+					return err
+				}
+				continue
+			}
 			if current != nil {
-				_ = delivery.Nack(true)
+				if err := settleWithoutProcessing(delivery, recorder, config, "prefetch_violation_requeue_decided"); err != nil {
+					return err
+				}
 				return fmt.Errorf("consumer delivered more than one in-flight message")
 			}
 			current = &delivery
 			state.InFlightMessageID = delivery.MessageID
 			if err := writeState(); err != nil {
-				_ = delivery.Nack(true)
+				if recordErr := recorder.Record(runtimeEvent(config, "state_failure_requeue_decided", delivery.MessageID)); recordErr != nil {
+					return errors.Join(err, fmt.Errorf("record state failure disposition: %w", recordErr))
+				}
+				if nackErr := delivery.Nack(true); nackErr != nil {
+					return errors.Join(err, fmt.Errorf("requeue after state failure: %w", nackErr))
+				}
 				return err
 			}
 			go func(delivery Delivery) {
-				completed <- completedDelivery{delivery: delivery, result: processor.ProcessPayload(processCtx, delivery.Body, delivery.MessageID)}
+				completed <- completedDelivery{delivery: delivery, result: processor.ProcessPayload(processCtx, delivery.Body, string(delivery.MessageID))}
 			}(delivery)
 		case finished := <-completed:
 			if current == nil {
 				return fmt.Errorf("received a processing result without an in-flight delivery")
 			}
-			if err := finishDelivery(finished, recorder, config.Revision); err != nil {
+			if err := finishDelivery(finished, recorder, config); err != nil {
 				return err
 			}
 			current = nil
@@ -177,28 +216,58 @@ func Run(ctx context.Context, config RuntimeConfig, consumer Consumer, processor
 	}
 }
 
-func finishDelivery(finished completedDelivery, recorder *Recorder, revision string) error {
-	event := Event{MessageID: finished.result.MessageID, WorkerRevision: revision}
+func finishDelivery(finished completedDelivery, recorder EvidenceRecorder, config RuntimeConfig) error {
+	if finished.result.Err != nil {
+		return fmt.Errorf("process message %s: %w", finished.result.MessageID, finished.result.Err)
+	}
+	event := runtimeEvent(config, "", finished.result.MessageID)
+	switch finished.result.Disposition {
+	case Acknowledge:
+		event.Event = "acknowledgement_decided"
+	case Requeue:
+		event.Event = "requeue_decided"
+	case Reject:
+		event.Event = "rejection_decided"
+	default:
+		return fmt.Errorf("unknown delivery disposition %d", finished.result.Disposition)
+	}
+	if err := recorder.Record(event); err != nil {
+		return fmt.Errorf("record delivery disposition evidence: %w", err)
+	}
 	switch finished.result.Disposition {
 	case Acknowledge:
 		if err := finished.delivery.Ack(); err != nil {
 			return fmt.Errorf("acknowledge %s: %w", finished.result.MessageID, err)
 		}
-		event.Event = "acknowledged"
 	case Requeue:
 		if err := finished.delivery.Nack(true); err != nil {
 			return fmt.Errorf("requeue %s: %w", finished.result.MessageID, err)
 		}
-		event.Event = "requeued"
 	case Reject:
 		if err := finished.delivery.Nack(false); err != nil {
 			return fmt.Errorf("reject %s: %w", finished.result.MessageID, err)
 		}
-		event.Event = "rejected"
-	default:
-		return fmt.Errorf("unknown delivery disposition %d", finished.result.Disposition)
 	}
-	return recorder.Record(event)
+	return nil
+}
+
+func settleWithoutProcessing(delivery Delivery, recorder EvidenceRecorder, config RuntimeConfig, eventName string) error {
+	if err := recorder.Record(runtimeEvent(config, eventName, delivery.MessageID)); err != nil {
+		return fmt.Errorf("record %s evidence: %w", eventName, err)
+	}
+	if err := delivery.Nack(true); err != nil {
+		return fmt.Errorf("requeue message %s without processing: %w", delivery.MessageID, err)
+	}
+	return nil
+}
+
+func runtimeEvent(config RuntimeConfig, event string, messageID example.MessageID) Event {
+	return Event{
+		Event:                event,
+		MessageID:            messageID,
+		ApplicationRevision:  config.ApplicationRevision,
+		WorkerArtifactDigest: config.WorkerArtifactDigest,
+	}
 }
 
 func gateOpen(path string) (bool, error) {
@@ -223,9 +292,9 @@ func writeStateFile(path string, state State) error {
 	return writeAtomic(path, append(data, '\n'), 0640)
 }
 
-func consumerTag(revision string) string {
+func consumerTag(artifactDigest string) string {
 	var builder strings.Builder
-	for _, char := range revision {
+	for _, char := range artifactDigest {
 		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-' || char == '_' {
 			builder.WriteRune(char)
 		} else {

@@ -9,7 +9,11 @@ import (
 
 func TestRunRejectsIncompleteInvocationBeforeConnecting(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	err := run(context.Background(), []string{"--queue", "jobs", "--revision", "revision-a"}, &stdout, &stderr)
+	err := run(context.Background(), []string{
+		"--queue", "jobs",
+		"--application-revision", "application-revision-a",
+		"--artifact-digest", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "invocation ID is required") {
 		t.Fatalf("error = %v", err)
 	}
@@ -20,7 +24,13 @@ func TestRunRejectsIncompleteInvocationBeforeConnecting(t *testing.T) {
 
 func TestRunRejectsUnsupportedBehaviorBeforeConnecting(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	err := run(context.Background(), []string{"--queue", "jobs", "--revision", "revision-a", "--invocation", "invocation-a", "--behavior", "mystery"}, &stdout, &stderr)
+	err := run(context.Background(), []string{
+		"--queue", "jobs",
+		"--application-revision", "application-revision-a",
+		"--artifact-digest", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"--invocation", "invocation-a",
+		"--behavior", "mystery",
+	}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "unsupported behavior") {
 		t.Fatalf("error = %v", err)
 	}

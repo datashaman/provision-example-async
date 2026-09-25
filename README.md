@@ -5,13 +5,13 @@ This repository contains a deliberately small, framework-neutral asynchronous ap
 The application has two native executables:
 
 - `provision-example-async-task` publishes deterministic messages to an existing RabbitMQ quorum queue and reports a message as accepted only after a publisher confirmation;
-- `provision-example-async-worker` is a persistent, gated consumer which reports its revision and gate state, acknowledges successful work, deliberately holds or fails selected messages, and records structured processing evidence.
+- `provision-example-async-worker` is a persistent, gated consumer which reports the application-wide Provision Revision, its Worker artifact digest, and its gate state; acknowledges successful work; deliberately holds or fails selected messages; and records structured processing evidence.
 
 It has no Laravel or PHP dependency. RabbitMQ is external to the application: the example never creates, replaces, or configures a queue.
 
 ## Message and delivery behavior
 
-Each message identity is derived from the Task revision, stable Task Invocation identity, and one-based sequence number. Retrying the same invocation publishes the same identities. A behavior change does not create a different identity.
+Each message carries the application-wide Provision Revision and immutable Task artifact SHA-256 digest. Its identity is derived from those values, the stable Task Invocation identity, and the one-based sequence number. Retrying the exact invocation publishes the same identities. A behavior change does not create a different identity and therefore must not be made while reusing an invocation identity.
 
 The Worker maintains a durable file ledger. The first successful processing of a message writes one immutable effect record; repeated delivery with the same identity is acknowledged and recorded as `duplicate_ignored` without applying the effect again. This demonstrates application-level idempotency under at-least-once delivery. It does not claim exactly-once execution.
 
@@ -30,7 +30,8 @@ The Task reads the AMQP URL from a credential file so its value is not present i
 provision-example-async-task \
   --broker-url-file /run/credentials/rabbitmq-url \
   --queue provision-example \
-  --revision task-v1 \
+  --application-revision application-revision-v1 \
+  --artifact-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --invocation schedule-example-2026-09-25T10:00:00Z \
   --count 3 \
   --behavior process
@@ -44,17 +45,18 @@ The Worker starts gated unless its gate file contains exactly `open`:
 provision-example-async-worker \
   --broker-url-file /run/credentials/rabbitmq-url \
   --queue provision-example \
-  --revision worker-v1 \
-  --gate-file /run/provision-example-async/worker-v1/gate \
-  --state-file /run/provision-example-async/worker-v1/state.json \
+  --application-revision application-revision-v1 \
+  --artifact-digest sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  --gate-file /run/provision-example-async/worker-generation-a/gate \
+  --state-file /run/provision-example-async/worker-generation-a/state.json \
   --evidence-file /var/lib/provision-example-async/evidence.jsonl \
   --ledger-dir /var/lib/provision-example-async/ledger \
   --hold-dir /run/provision-example-async/holds
 ```
 
-The atomic state file reports the Worker revision, queue, connectivity, gate, consumer, and in-flight-message state. Processing evidence is append-only JSON Lines. To release a held message, create a file in the hold directory named with the SHA-256 of its message identity plus `.release`; its exact content is the message identity followed by a newline. Provision acceptance tooling can derive and create this control without changing the application process.
+The atomic state file reports the application-wide Provision Revision, Worker artifact digest, queue, connectivity, gate, consumer, and in-flight-message state. Processing evidence is append-only JSON Lines and repeats the application and component artifact identities. If evidence cannot be recorded, the Worker exits without acknowledging, requeueing, or rejecting the affected delivery; closing its RabbitMQ connection then makes the unacknowledged delivery available again according to RabbitMQ semantics. To release a held message, create a file in the hold directory named with the SHA-256 of its message identity plus `.release`; its exact content is the message identity followed by a newline. Provision acceptance tooling can derive and create this control without changing the application process.
 
-Closing the gate prevents new deliveries. A delivery already in flight may finish. Stopping the Worker while a delivery is held negatively acknowledges it with requeue enabled so another eligible Worker can process it.
+Closing the gate prevents new deliveries. A delivery already being processed may finish. A delivery buffered by the client at the gate boundary is recorded and safely requeued without being processed. Stopping the Worker while a delivery is held negatively acknowledges it with requeue enabled so another eligible Worker can process it.
 
 ## Build and release assets
 

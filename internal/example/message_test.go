@@ -2,19 +2,25 @@ package example
 
 import "testing"
 
+const (
+	testApplicationRevision ApplicationRevision = "application-revision-a"
+	testTaskArtifact        ArtifactDigest      = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testInvocation          InvocationID        = "schedule/example/2026-09-25T10:00:00Z"
+)
+
 func TestNewMessageHasStableIdentity(t *testing.T) {
-	first, err := NewMessage("revision-a", "schedule/example/2026-09-25T10:00:00Z", 2, BehaviorProcess)
+	first, err := NewMessage(testApplicationRevision, testTaskArtifact, testInvocation, 2, BehaviorProcess)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := NewMessage("revision-a", "schedule/example/2026-09-25T10:00:00Z", 2, BehaviorProcess)
+	second, err := NewMessage(testApplicationRevision, testTaskArtifact, testInvocation, 2, BehaviorProcess)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.ID != second.ID {
 		t.Fatalf("message IDs differ: %q != %q", first.ID, second.ID)
 	}
-	if first.ID == "" || first.InvocationID == "" || first.Revision != "revision-a" || first.Sequence != 2 {
+	if first.ID == "" || first.InvocationID == "" || first.ApplicationRevision != testApplicationRevision || first.TaskArtifactDigest != testTaskArtifact || first.Sequence != 2 {
 		t.Fatalf("unexpected message: %#v", first)
 	}
 	if first.SchemaVersion != MessageSchemaVersion {
@@ -22,20 +28,22 @@ func TestNewMessageHasStableIdentity(t *testing.T) {
 	}
 }
 
-func TestNewMessageIdentityChangesOnlyWhenIdentityInputsChange(t *testing.T) {
-	base, err := NewMessage("revision-a", "invocation-a", 1, BehaviorProcess)
+func TestNewMessageIdentityChangesWhenIdentityInputsChange(t *testing.T) {
+	base, err := NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, BehaviorProcess)
 	if err != nil {
 		t.Fatal(err)
 	}
-	changedRevision, _ := NewMessage("revision-b", "invocation-a", 1, BehaviorProcess)
-	changedInvocation, _ := NewMessage("revision-a", "invocation-b", 1, BehaviorProcess)
-	changedSequence, _ := NewMessage("revision-a", "invocation-a", 2, BehaviorProcess)
-	changedBehavior, _ := NewMessage("revision-a", "invocation-a", 1, BehaviorHold)
+	changedApplication, _ := NewMessage("application-revision-b", testTaskArtifact, "invocation-a", 1, BehaviorProcess)
+	changedArtifact, _ := NewMessage("application-revision-a", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "invocation-a", 1, BehaviorProcess)
+	changedInvocation, _ := NewMessage(testApplicationRevision, testTaskArtifact, "invocation-b", 1, BehaviorProcess)
+	changedSequence, _ := NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 2, BehaviorProcess)
+	changedBehavior, _ := NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, BehaviorHold)
 
 	for name, got := range map[string]Message{
-		"revision":   changedRevision,
-		"invocation": changedInvocation,
-		"sequence":   changedSequence,
+		"application revision": changedApplication,
+		"task artifact":        changedArtifact,
+		"invocation":           changedInvocation,
+		"sequence":             changedSequence,
 	} {
 		if got.ID == base.ID {
 			t.Fatalf("changing %s did not change message ID", name)
@@ -48,19 +56,39 @@ func TestNewMessageIdentityChangesOnlyWhenIdentityInputsChange(t *testing.T) {
 
 func TestNewMessageRejectsInvalidInputs(t *testing.T) {
 	for name, tc := range map[string]struct {
-		revision, invocation string
-		sequence             int
-		behavior             Behavior
+		application ApplicationRevision
+		artifact    ArtifactDigest
+		invocation  InvocationID
+		sequence    int
+		behavior    Behavior
 	}{
-		"revision":   {"", "invocation", 1, BehaviorProcess},
-		"invocation": {"revision", "", 1, BehaviorProcess},
-		"sequence":   {"revision", "invocation", 0, BehaviorProcess},
-		"behavior":   {"revision", "invocation", 1, Behavior("unknown")},
+		"application revision": {"", testTaskArtifact, "invocation", 1, BehaviorProcess},
+		"artifact digest":      {testApplicationRevision, "not-a-digest", "invocation", 1, BehaviorProcess},
+		"invocation":           {testApplicationRevision, testTaskArtifact, "", 1, BehaviorProcess},
+		"sequence":             {testApplicationRevision, testTaskArtifact, "invocation", 0, BehaviorProcess},
+		"behavior":             {testApplicationRevision, testTaskArtifact, "invocation", 1, Behavior("unknown")},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewMessage(tc.revision, tc.invocation, tc.sequence, tc.behavior); err == nil {
+			if _, err := NewMessage(tc.application, tc.artifact, tc.invocation, tc.sequence, tc.behavior); err == nil {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestBehaviorSemanticsAreCentralized(t *testing.T) {
+	for behavior, want := range map[Behavior]BehaviorSemantics{
+		BehaviorProcess:  {},
+		BehaviorHold:     {Hold: true},
+		BehaviorFailOnce: {FailuresBeforeSuccess: 1},
+		BehaviorReject:   {Reject: true},
+	} {
+		got, err := behavior.Semantics()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s semantics = %#v; want %#v", behavior, got, want)
+		}
 	}
 }

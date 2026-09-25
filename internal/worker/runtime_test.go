@@ -3,8 +3,10 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,12 +47,12 @@ func TestRuntimeStartsGatedThenConsumesAndAcknowledges(t *testing.T) {
 	statePath := filepath.Join(dir, "state.json")
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-a")
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
 	consumer := &fakeConsumer{deliveries: make(chan Delivery, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, RuntimeConfig{Revision: "worker-a", Queue: "jobs", GateFile: gatePath, StateFile: statePath, PollInterval: 10 * time.Millisecond}, consumer, processor, recorder)
+		done <- Run(ctx, RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact, Queue: "jobs", GateFile: gatePath, StateFile: statePath, PollInterval: 10 * time.Millisecond}, consumer, processor, recorder)
 	}()
 
 	waitFor(t, func() bool {
@@ -68,7 +70,7 @@ func TestRuntimeStartsGatedThenConsumesAndAcknowledges(t *testing.T) {
 		return err == nil && !state.Gated && state.Consuming
 	})
 
-	message, _ := example.NewMessage("task-a", "invocation-a", 1, example.BehaviorProcess)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorProcess)
 	payload, _ := message.Marshal()
 	acked := make(chan struct{}, 1)
 	consumer.deliveries <- Delivery{
@@ -116,16 +118,16 @@ func TestRuntimeRequeuesInflightDeliveryOnShutdown(t *testing.T) {
 	}
 	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
 	defer recorder.Close()
-	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, "worker-a")
+	processor, _ := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
 	consumer := &fakeConsumer{deliveries: make(chan Delivery, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, RuntimeConfig{Revision: "worker-a", Queue: "jobs", GateFile: gatePath, StateFile: filepath.Join(dir, "state.json"), PollInterval: 10 * time.Millisecond}, consumer, processor, recorder)
+		done <- Run(ctx, RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact, Queue: "jobs", GateFile: gatePath, StateFile: filepath.Join(dir, "state.json"), PollInterval: 10 * time.Millisecond}, consumer, processor, recorder)
 	}()
 	waitFor(t, func() bool { starts, _ := consumer.counts(); return starts == 1 })
 
-	message, _ := example.NewMessage("task-a", "invocation-a", 1, example.BehaviorHold)
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-a", 1, example.BehaviorHold)
 	payload, _ := message.Marshal()
 	requeued := make(chan bool, 1)
 	consumer.deliveries <- Delivery{
@@ -149,6 +151,120 @@ func TestRuntimeRequeuesInflightDeliveryOnShutdown(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRuntimeRequeuesBufferedDeliveryAfterGateClosesWithoutProcessing(t *testing.T) {
+	dir := t.TempDir()
+	gatePath := filepath.Join(dir, "gate")
+	statePath := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(gatePath, []byte("open\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	recorder, _ := NewRecorder(filepath.Join(dir, "evidence.jsonl"))
+	defer recorder.Close()
+	ledgerDir := filepath.Join(dir, "ledger")
+	processor, _ := NewProcessor(ledgerDir, filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	consumer := &fakeConsumer{deliveries: make(chan Delivery, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact, Queue: "jobs", GateFile: gatePath, StateFile: statePath, PollInterval: time.Hour}, consumer, processor, recorder)
+	}()
+	waitFor(t, func() bool { starts, _ := consumer.counts(); return starts == 1 })
+
+	if err := os.WriteFile(gatePath, []byte("closed\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-after-gate", 1, example.BehaviorProcess)
+	payload, _ := message.Marshal()
+	requeued := make(chan bool, 1)
+	consumer.deliveries <- Delivery{
+		Body:      payload,
+		MessageID: message.ID,
+		Ack:       func() error { t.Error("post-gate delivery was acknowledged"); return nil },
+		Nack:      func(requeue bool) error { requeued <- requeue; return nil },
+	}
+	select {
+	case got := <-requeued:
+		if !got {
+			t.Fatal("post-gate delivery was rejected rather than requeued")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-gate delivery was not requeued")
+	}
+	state, err := readState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cancels := consumer.counts()
+	if !state.Gated || state.Consuming || cancels != 1 {
+		t.Fatalf("gate race state = %#v, cancels = %d", state, cancels)
+	}
+	entries, err := os.ReadDir(filepath.Join(ledgerDir, "processed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("post-gate delivery produced %d effects; want none", len(entries))
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type failingRecorder struct {
+	failEvent string
+}
+
+func (r *failingRecorder) Record(event Event) error {
+	if event.Event == r.failEvent {
+		return errors.New("evidence storage unavailable")
+	}
+	return nil
+}
+
+func TestRuntimeDoesNotSettleDeliveryWhenDispositionEvidenceFails(t *testing.T) {
+	dir := t.TempDir()
+	gatePath := filepath.Join(dir, "gate")
+	if err := os.WriteFile(gatePath, []byte("open\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &failingRecorder{failEvent: "acknowledgement_decided"}
+	processor, err := NewProcessor(filepath.Join(dir, "ledger"), filepath.Join(dir, "holds"), recorder, testApplicationRevision, testWorkerArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &fakeConsumer{deliveries: make(chan Delivery, 1)}
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(context.Background(), RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact, Queue: "jobs", GateFile: gatePath, StateFile: filepath.Join(dir, "state.json"), PollInterval: 10 * time.Millisecond}, consumer, processor, recorder)
+	}()
+	waitFor(t, func() bool { starts, _ := consumer.counts(); return starts == 1 })
+
+	message, _ := example.NewMessage(testApplicationRevision, testTaskArtifact, "invocation-evidence-failure", 1, example.BehaviorProcess)
+	payload, _ := message.Marshal()
+	settled := make(chan string, 1)
+	consumer.deliveries <- Delivery{
+		Body:      payload,
+		MessageID: message.ID,
+		Ack:       func() error { settled <- "ack"; return nil },
+		Nack:      func(bool) error { settled <- "nack"; return nil },
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "evidence storage unavailable") {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not fail when evidence recording failed")
+	}
+	select {
+	case operation := <-settled:
+		t.Fatalf("delivery was settled with %s despite evidence failure", operation)
+	default:
 	}
 }
 

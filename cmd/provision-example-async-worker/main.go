@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/datashaman/provision-example-async/internal/example"
 	"github.com/datashaman/provision-example-async/internal/rabbit"
 	"github.com/datashaman/provision-example-async/internal/worker"
 )
@@ -28,7 +29,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	brokerURLFile := flags.String("broker-url-file", "", "path to a file containing the AMQP URL")
 	queue := flags.String("queue", "", "existing RabbitMQ quorum queue")
-	revision := flags.String("revision", "", "immutable Worker revision identity")
+	applicationRevision := flags.String("application-revision", "", "immutable Provision Application Revision identity")
+	artifactDigest := flags.String("artifact-digest", "", "immutable Worker artifact SHA-256 digest")
 	gateFile := flags.String("gate-file", "", "intake gate file; exact content 'open' enables consumption")
 	stateFile := flags.String("state-file", "", "atomic JSON worker-state file")
 	evidenceFile := flags.String("evidence-file", "", "append-only JSON Lines processing evidence")
@@ -41,7 +43,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
 	}
-	config := worker.RuntimeConfig{Revision: *revision, Queue: *queue, GateFile: *gateFile, StateFile: *stateFile, PollInterval: *pollInterval}
+	config := worker.RuntimeConfig{
+		ApplicationRevision:  example.ApplicationRevision(*applicationRevision),
+		WorkerArtifactDigest: example.ArtifactDigest(*artifactDigest),
+		Queue:                *queue,
+		GateFile:             *gateFile,
+		StateFile:            *stateFile,
+		PollInterval:         *pollInterval,
+	}
 	if err := config.Validate(); err != nil {
 		return err
 	}
@@ -53,7 +62,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		return fmt.Errorf("open evidence recorder: %w", err)
 	}
 	defer recorder.Close()
-	processor, err := worker.NewProcessor(*ledgerDir, *holdDir, recorder, *revision)
+	processor, err := worker.NewProcessor(*ledgerDir, *holdDir, recorder, config.ApplicationRevision, config.WorkerArtifactDigest)
 	if err != nil {
 		return err
 	}

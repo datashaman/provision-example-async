@@ -12,11 +12,12 @@ import (
 const EvidenceSchemaVersion = "provision.dev/example-async-task-evidence/v1alpha1"
 
 type Config struct {
-	Queue        string
-	Revision     string
-	InvocationID string
-	Count        int
-	Behavior     example.Behavior
+	Queue               string
+	ApplicationRevision example.ApplicationRevision
+	TaskArtifactDigest  example.ArtifactDigest
+	InvocationID        example.InvocationID
+	Count               int
+	Behavior            example.Behavior
 }
 
 type Publisher interface {
@@ -24,20 +25,22 @@ type Publisher interface {
 }
 
 type Confirmation struct {
-	SchemaVersion string `json:"schemaVersion"`
-	Event         string `json:"event"`
-	MessageID     string `json:"messageId"`
-	Revision      string `json:"revision"`
-	InvocationID  string `json:"invocationId"`
-	Sequence      int    `json:"sequence"`
+	SchemaVersion       string                      `json:"schemaVersion"`
+	Event               string                      `json:"event"`
+	MessageID           example.MessageID           `json:"messageId"`
+	ApplicationRevision example.ApplicationRevision `json:"applicationRevision"`
+	TaskArtifactDigest  example.ArtifactDigest      `json:"taskArtifactDigest"`
+	InvocationID        example.InvocationID        `json:"invocationId"`
+	Sequence            int                         `json:"sequence"`
 }
 
 type Summary struct {
-	SchemaVersion string `json:"schemaVersion"`
-	Event         string `json:"event"`
-	Revision      string `json:"revision"`
-	InvocationID  string `json:"invocationId"`
-	Confirmed     int    `json:"confirmed"`
+	SchemaVersion       string                      `json:"schemaVersion"`
+	Event               string                      `json:"event"`
+	ApplicationRevision example.ApplicationRevision `json:"applicationRevision"`
+	TaskArtifactDigest  example.ArtifactDigest      `json:"taskArtifactDigest"`
+	InvocationID        example.InvocationID        `json:"invocationId"`
+	Confirmed           int                         `json:"confirmed"`
 }
 
 func (c Config) Validate() error {
@@ -47,7 +50,7 @@ func (c Config) Validate() error {
 	if c.Count < 1 || c.Count > 10000 {
 		return fmt.Errorf("count must be between 1 and 10000")
 	}
-	_, err := example.NewMessage(c.Revision, c.InvocationID, 1, c.Behavior)
+	_, err := example.NewMessage(c.ApplicationRevision, c.TaskArtifactDigest, c.InvocationID, 1, c.Behavior)
 	return err
 }
 
@@ -57,7 +60,7 @@ func Run(ctx context.Context, config Config, publisher Publisher, output io.Writ
 	}
 	encoder := json.NewEncoder(output)
 	for sequence := 1; sequence <= config.Count; sequence++ {
-		message, err := example.NewMessage(config.Revision, config.InvocationID, sequence, config.Behavior)
+		message, err := example.NewMessage(config.ApplicationRevision, config.TaskArtifactDigest, config.InvocationID, sequence, config.Behavior)
 		if err != nil {
 			return err
 		}
@@ -69,22 +72,24 @@ func Run(ctx context.Context, config Config, publisher Publisher, output io.Writ
 			return fmt.Errorf("broker did not confirm message %s", message.ID)
 		}
 		if err := encoder.Encode(Confirmation{
-			SchemaVersion: EvidenceSchemaVersion,
-			Event:         "message_confirmed",
-			MessageID:     message.ID,
-			Revision:      message.Revision,
-			InvocationID:  message.InvocationID,
-			Sequence:      message.Sequence,
+			SchemaVersion:       EvidenceSchemaVersion,
+			Event:               "message_confirmed",
+			MessageID:           message.ID,
+			ApplicationRevision: message.ApplicationRevision,
+			TaskArtifactDigest:  message.TaskArtifactDigest,
+			InvocationID:        message.InvocationID,
+			Sequence:            message.Sequence,
 		}); err != nil {
 			return fmt.Errorf("write confirmation evidence: %w", err)
 		}
 	}
 	if err := encoder.Encode(Summary{
-		SchemaVersion: EvidenceSchemaVersion,
-		Event:         "publish_complete",
-		Revision:      config.Revision,
-		InvocationID:  config.InvocationID,
-		Confirmed:     config.Count,
+		SchemaVersion:       EvidenceSchemaVersion,
+		Event:               "publish_complete",
+		ApplicationRevision: config.ApplicationRevision,
+		TaskArtifactDigest:  config.TaskArtifactDigest,
+		InvocationID:        config.InvocationID,
+		Confirmed:           config.Count,
 	}); err != nil {
 		return fmt.Errorf("write summary evidence: %w", err)
 	}
