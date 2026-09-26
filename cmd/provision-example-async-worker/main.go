@@ -15,16 +15,18 @@ import (
 	"github.com/datashaman/provision-example-async/internal/worker"
 )
 
+const version = "0.2.0"
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Args[1:], os.Stderr); err != nil {
+	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "provision-example-async-worker: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, args []string, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("provision-example-async-worker", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	brokerURLFile := flags.String("broker-url-file", "", "path to a file containing the AMQP URL")
@@ -37,11 +39,16 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	ledgerDir := flags.String("ledger-dir", "", "durable idempotency ledger directory")
 	holdDir := flags.String("hold-dir", "", "directory containing explicit hold-release controls")
 	pollInterval := flags.Duration("poll-interval", 100*time.Millisecond, "gate and hold polling interval")
+	showVersion := flags.Bool("version", false, "print the Worker version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
+	}
+	if *showVersion {
+		_, err := fmt.Fprintln(stdout, version)
+		return err
 	}
 	config := worker.RuntimeConfig{
 		ApplicationRevision:  example.ApplicationRevision(*applicationRevision),

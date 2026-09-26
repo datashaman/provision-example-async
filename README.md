@@ -54,6 +54,10 @@ provision-example-async-worker \
   --hold-dir /run/provision-example-async/holds
 ```
 
+`provision-example-async-worker --version` prints the released Worker version
+without opening a broker connection. Provision still binds deployments to the
+archive digest rather than trusting this informational version string.
+
 The atomic state file reports the Worker's application-wide Provision Revision, Worker artifact digest, queue, connectivity, gate, consumer, and in-flight-message state. Processing evidence is append-only JSON Lines and records the producing Task's Application Revision and artifact digest separately from the active Worker's Application Revision and artifact digest. A candidate Worker may therefore finish a message released by the previous Revision without losing either identity. If evidence cannot be recorded, the Worker exits without acknowledging, requeueing, or rejecting the affected delivery; closing its RabbitMQ connection then makes the unacknowledged delivery available again according to RabbitMQ semantics. To release a held message, create a file in the hold directory named with the SHA-256 of its message identity plus `.release`; its exact content is the message identity followed by a newline. Provision acceptance tooling can derive and create this control without changing the application process.
 
 Closing the gate prevents new deliveries. A delivery already being processed may finish. A delivery buffered by the client at the gate boundary is recorded and safely requeued without being processed. Stopping the Worker while a delivery is held negatively acknowledges it with requeue enabled so another eligible Worker can process it.
