@@ -239,14 +239,20 @@ func finishDelivery(finished completedDelivery, recorder EvidenceRecorder, confi
 		if err := finished.delivery.Ack(); err != nil {
 			return fmt.Errorf("acknowledge %s: %w", finished.result.MessageID, err)
 		}
+		event.Event = "acknowledged"
 	case Requeue:
 		if err := finished.delivery.Nack(true); err != nil {
 			return fmt.Errorf("requeue %s: %w", finished.result.MessageID, err)
 		}
+		event.Event = "requeued"
 	case Reject:
 		if err := finished.delivery.Nack(false); err != nil {
 			return fmt.Errorf("reject %s: %w", finished.result.MessageID, err)
 		}
+		event.Event = "rejected"
+	}
+	if err := recorder.Record(event); err != nil {
+		return fmt.Errorf("record settled delivery evidence: %w", err)
 	}
 	return nil
 }
