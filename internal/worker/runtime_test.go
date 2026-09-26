@@ -226,6 +226,53 @@ func (r *failingRecorder) Record(event Event) error {
 	return nil
 }
 
+type recordingRecorder struct {
+	events []Event
+}
+
+func (r *recordingRecorder) Record(event Event) error {
+	r.events = append(r.events, event)
+	return nil
+}
+
+func TestFinishDeliveryRecordsAcknowledgementOnlyAfterAckSucceeds(t *testing.T) {
+	config := RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact}
+	messageID := example.MessageID("message-a")
+	recorder := &recordingRecorder{}
+	finished := completedDelivery{
+		delivery: Delivery{MessageID: messageID, Ack: func() error { return nil }},
+		result:   Result{MessageID: messageID, Disposition: Acknowledge},
+	}
+	if err := finishDelivery(finished, recorder, config); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.events) != 2 || recorder.events[0].Event != "acknowledgement_decided" || recorder.events[1].Event != "acknowledged" {
+		t.Fatalf("acknowledgement events = %#v", recorder.events)
+	}
+	for _, event := range recorder.events {
+		if event.MessageID != messageID || event.WorkerApplicationRevision != testApplicationRevision || event.WorkerArtifactDigest != testWorkerArtifact {
+			t.Fatalf("acknowledgement event lost Worker or message identity: %#v", event)
+		}
+	}
+}
+
+func TestFinishDeliveryDoesNotRecordAcknowledgedWhenAckFails(t *testing.T) {
+	config := RuntimeConfig{ApplicationRevision: testApplicationRevision, WorkerArtifactDigest: testWorkerArtifact}
+	messageID := example.MessageID("message-b")
+	recorder := &recordingRecorder{}
+	finished := completedDelivery{
+		delivery: Delivery{MessageID: messageID, Ack: func() error { return errors.New("broker unavailable") }},
+		result:   Result{MessageID: messageID, Disposition: Acknowledge},
+	}
+	err := finishDelivery(finished, recorder, config)
+	if err == nil || !strings.Contains(err.Error(), "broker unavailable") {
+		t.Fatalf("Ack failure = %v", err)
+	}
+	if len(recorder.events) != 1 || recorder.events[0].Event != "acknowledgement_decided" {
+		t.Fatalf("Ack failure recorded false completion evidence: %#v", recorder.events)
+	}
+}
+
 func TestRuntimeDoesNotSettleDeliveryWhenDispositionEvidenceFails(t *testing.T) {
 	dir := t.TempDir()
 	gatePath := filepath.Join(dir, "gate")
